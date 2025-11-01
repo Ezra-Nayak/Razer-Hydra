@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual Environment
+.venv1/
+
+# IDE files
+.idea/
+
+# Output files
+debug_output/
+
+# personal
+testing_grounds/
+backups/
+analyse_layers.py
+drawing_plan.txt
+diagnostic_Residual.png
+diagnostic_Skeleton.png
