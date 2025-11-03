@@ -14,7 +14,10 @@ debug_output/
 # personal
 testing_grounds/
 backups/
-analyse_layers.py
+analyse layers.py
 drawing_plan.txt
 diagnostic_Residual.png
 diagnostic_Skeleton.png
+
+# Local scripts
+*.bat
