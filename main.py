@@ -36,7 +36,7 @@ from model import create_model
 
 def play_sound_async(sound_name):
     """Plays a sound from the 'sounds' folder in a non-blocking background thread."""
-    sound_path = os.path.join("sounds", sound_name)
+    sound_path = os.path.join("sounds/Felix", sound_name)
     if os.path.exists(sound_path):
         # daemon=True ensures the thread won't prevent the program from exiting
         threading.Thread(target=playsound, args=(sound_path,), daemon=True).start()
@@ -71,7 +71,7 @@ BINARY_THRESHOLD = 240
 MINIMUM_PIXEL_AREA = 2 # Removes any blob smaller than this pixel count.
 
 # --- Stage 5: Drawing Parameters ---
-DRAWING_SPEED_PERCENT = 100     # Overall speed. 100 is fastest, 10 is 10% speed. Affects all drawing delays.
+DRAWING_SPEED_PERCENT = 60     # Overall speed. 100 is fastest, 10 is 10% speed. Affects all drawing delays.
 GLIDE_STEP_SIZE = 4            # For smooth pen-up moves in Innovative mode. Higher is faster/jumpier, 1 is pixel-by-pixel.
 BATCH_SIZE = 20                 # Accumulates this many small moves into one driver command for speed.
 INTER_STROKE_DELAY_SEC = 0.001  # The base "cool-down" between strokes, used at 100% speed.
