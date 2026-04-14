@@ -71,8 +71,8 @@ BINARY_THRESHOLD = 240
 MINIMUM_PIXEL_AREA = 2 # Removes any blob smaller than this pixel count.
 
 # --- Stage 5: Drawing Parameters ---
-DRAWING_SPEED_PERCENT = 60     # Overall speed. 100 is fastest, 10 is 10% speed. Affects all drawing delays.
-GLIDE_STEP_SIZE = 4            # For smooth pen-up moves in Innovative mode. Higher is faster/jumpier, 1 is pixel-by-pixel.
+DRAWING_SPEED_PERCENT = 100     # Overall speed. 100 is fastest, 10 is 10% speed. Affects all drawing delays.
+GLIDE_STEP_SIZE = 3            # For smooth pen-up moves in Innovative mode. Higher is faster/jumpier, 1 is pixel-by-pixel.
 BATCH_SIZE = 20                 # Accumulates this many small moves into one driver command for speed.
 INTER_STROKE_DELAY_SEC = 0.001  # The base "cool-down" between strokes, used at 100% speed.
 
@@ -295,63 +295,41 @@ class ImageSketcher:
         return path
 
     def _draw_path(self, path, scale, offset_x, offset_y, scaling_factor):
-        """
-        Draws a path of vertices by interpolating lines between them.
-        This allows it to draw long, complex strokes from a sparse list of points.
-        (Version 2: Corrected logic to prevent infinite loops).
-        """
         if len(path) < 1 or self.panic_event.is_set():
             return
 
-        # 1. Calculate target start position.
         start_img_x, start_img_y = path[0]
         start_screen_x = int(self.canvas_top_left[0] + offset_x + (start_img_x * scale))
         start_screen_y = int(self.canvas_top_left[1] + offset_y + (start_img_y * scale))
 
-        # 2. Move smoothly to the start of the path (pen up) using the new glide function.
         self._glide_to(start_screen_x, start_screen_y, scaling_factor)
-
         if self.panic_event.is_set(): return
 
-        # 3. Start drawing.
+        # --- ENGINE STABILIZATION (Fixes Roblox/Skribbl) ---
         self.razer.mouse_down()
+        time.sleep(0.015)  # Guarantees engine registers the mouse down before moving
+
         self.current_pen_state = "[yellow]DRAWING[/yellow]"
 
-        batched_dx = 0
-        batched_dy = 0
+        batched_dx, batched_dy = 0, 0
         last_screen_x, last_screen_y = start_screen_x, start_screen_y
         move_count = 0
 
-        # 4. Iterate through the line segments that make up the stroke.
         for i in range(1, len(path)):
             if self.panic_event.is_set(): break
-
-            # Get the start and end points for this line segment.
             x1, y1 = path[i - 1]
             x2, y2 = path[i]
 
-            # --- ROBUST LINE INTERPOLATION ---
-            dx_line = abs(x2 - x1)
-            dy_line = -abs(y2 - y1)
-            sx = 1 if x1 < x2 else -1
-            sy = 1 if y1 < y2 else -1
+            dx_line, dy_line = abs(x2 - x1), -abs(y2 - y1)
+            sx, sy = (1 if x1 < x2 else -1), (1 if y1 < y2 else -1)
             err = dx_line + dy_line
 
             while True:
-                # The cursor is already at (x1, y1). We now need to move to the *next* pixel.
-                if x1 == x2 and y1 == y2:
-                    break  # Reached the end of this segment.
-
-                # Calculate the next pixel in the line.
+                if x1 == x2 and y1 == y2: break
                 e2 = 2 * err
-                if e2 >= dy_line:
-                    err += dy_line
-                    x1 += sx
-                if e2 <= dx_line:
-                    err += dx_line
-                    y1 += sy
+                if e2 >= dy_line: err += dy_line; x1 += sx
+                if e2 <= dx_line: err += dx_line; y1 += sy
 
-                # We have the next pixel (x1, y1). Convert to screen coords and batch the move.
                 screen_x = int(self.canvas_top_left[0] + offset_x + (x1 * scale))
                 screen_y = int(self.canvas_top_left[1] + offset_y + (y1 * scale))
 
@@ -372,13 +350,13 @@ class ImageSketcher:
 
                 last_screen_x, last_screen_y = screen_x, screen_y
 
-        # Send any remaining moves in the final batch.
         if batched_dx != 0 or batched_dy != 0:
             self.razer.move_relative(int(batched_dx * scaling_factor), int(batched_dy * scaling_factor))
             self.api_call_counter += 1
             time.sleep(self.intra_stroke_delay)
 
-        # 5. Lift the pen.
+        # --- ENGINE STABILIZATION ---
+        time.sleep(0.015)  # Wait for engine to catch the last coordinate
         self.razer.mouse_up()
 
     def _calibrate_canvas(self, live, layout):
@@ -694,21 +672,52 @@ class ImageSketcher:
     def draw_innovative(self, image_layer, live, layout, image_path):
         """Draws using a highly optimized algorithm, updating a persistent Rich layout."""
         # --- TUNABLE PARAMETERS ---
-        STITCHING_DISTANCE = 3
+        HATCH_SPACING = 4  # Pixels between shading lines (lower = darker/longer draw time)
+        SHADING_THRESHOLD = 130  # 0-255. Pixels darker than this in original img will be shaded
+        STITCHING_DISTANCE = 6  # MUST be > HATCH_SPACING to allow S-curve stitching!
         GRID_DIVISIONS = 2
         WINDOWS_SCALING_FACTOR = 2.0
 
         panic_thread = threading.Thread(target=self._panic_listen, daemon=True)
         panic_thread.start()
 
-        # --- Path calculation (no changes here) ---
+        # --- SOTA SHADING & HATCHING EXTRACTION ---
+        self._log("Processing dynamic shading layer...")
+        orig_img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+
+        if orig_img is not None:
+            img_h, img_w = self.image_shape
+            orig_img = cv2.resize(orig_img, (img_w, img_h), interpolation=cv2.INTER_AREA)
+
+            # Blur to remove noise, then threshold to isolate dark regions
+            blurred = cv2.GaussianBlur(orig_img, (5, 5), 0)
+            _, shading_mask = cv2.threshold(blurred, SHADING_THRESHOLD, 255, cv2.THRESH_BINARY_INV)
+
+            # Create the horizontal scanline hatching pattern
+            hatch_mask = np.zeros_like(shading_mask)
+            hatch_mask[::HATCH_SPACING, :] = 255  # Draw a line every N pixels
+
+            # Mask the hatching to only appear in dark regions
+            final_shading = cv2.bitwise_and(shading_mask, hatch_mask)
+
+            # Remove shading where lineart already exists to prevent double-drawing
+            final_shading[image_layer > 0] = 0
+
+            # Merge lineart and shading into a single master drawing plane
+            working_layer = cv2.bitwise_or(image_layer, final_shading)
+            self._log("Shading integrated successfully.")
+        else:
+            working_layer = image_layer
+
+        # --- Path calculation (Original highly optimized horizontal segmenter) ---
         self._log("Generating horizontal line plan...")
-        ys, xs = np.where(image_layer > 0);
-        rows = {};
+        ys, xs = np.where(working_layer > 0)
+        rows = {}
         for y, x in zip(ys, xs):
             if y not in rows: rows[y] = []
             rows[y].append(x)
         for y in rows: rows[y].sort()
+
         segments = set()
         for y in sorted(rows.keys()):
             x_coords = rows[y]
@@ -716,54 +725,72 @@ class ImageSketcher:
             start_x = x_coords[0]
             for i in range(1, len(x_coords)):
                 if x_coords[i] != x_coords[i - 1] + 1:
-                    segments.add(((start_x, y), (x_coords[i - 1], y)));
+                    segments.add(((start_x, y), (x_coords[i - 1], y)))
                     start_x = x_coords[i]
             segments.add(((start_x, y), (x_coords[-1], y)))
+
         self._log(f"Found {len(segments)} raw segments.")
-        self._log("Stitching segments into super-strokes...")
-        endpoints = {};
+        self._log("Stitching segments into S-curve super-strokes...")
+
+        endpoints = {}
         for start_pt, end_pt in segments:
             endpoints.setdefault(start_pt, []).append((start_pt, end_pt))
             endpoints.setdefault(end_pt, []).append((start_pt, end_pt))
+
         super_strokes = []
         while segments:
             current_path = list(segments.pop())
+            # Extend forwards
             while True:
                 found, segments, new_end = self._extend_path(current_path[-1], segments, endpoints, STITCHING_DISTANCE)
                 if not found: break
                 current_path.append(new_end)
+            # Extend backwards
             while True:
                 found, segments, new_start = self._extend_path(current_path[0], segments, endpoints, STITCHING_DISTANCE)
                 if not found: break
                 current_path.insert(0, new_start)
             super_strokes.append(current_path)
-        self._log(f"Consolidated into {len(super_strokes)} strokes.")
+
+        self._log(f"Consolidated into {len(super_strokes)} continuous strokes.")
         self._log(f"Sorting strokes into {GRID_DIVISIONS}x{GRID_DIVISIONS} grid...")
+
         image_height, image_width = self.image_shape
-        cell_width = image_width / GRID_DIVISIONS;
+        cell_width = image_width / GRID_DIVISIONS
         cell_height = image_height / GRID_DIVISIONS
         grid = [[] for _ in range(GRID_DIVISIONS * GRID_DIVISIONS)]
+
         for stroke in super_strokes:
-            center_x = (stroke[0][0] + stroke[1][0]) / 2;
+            center_x = (stroke[0][0] + stroke[1][0]) / 2
             center_y = (stroke[0][1] + stroke[1][1]) / 2
-            grid_x = int(center_x // cell_width);
+            grid_x = int(center_x // cell_width)
             grid_y = int(center_y // cell_height)
+            # Boundary clamp
+            grid_x = min(grid_x, GRID_DIVISIONS - 1)
+            grid_y = min(grid_y, GRID_DIVISIONS - 1)
             grid[grid_y * GRID_DIVISIONS + grid_x].append(stroke)
+
         self._log("Applying Nearest Neighbor sort...")
         ordered_strokes = []
         last_pen_position = (0, 0)
+
         for cell_idx, cell in enumerate(grid):
             if not cell: continue
             undrawn_in_cell = list(cell)
             while undrawn_in_cell:
-                best_stroke_info = None;
+                best_stroke_info = None
                 min_dist = float('inf')
                 for i, stroke in enumerate(undrawn_in_cell):
                     start_point, end_point = stroke[0], stroke[-1]
                     dist_to_start = self._calculate_distance(last_pen_position, start_point)
                     dist_to_end = self._calculate_distance(last_pen_position, end_point)
-                    if dist_to_start < min_dist: min_dist = dist_to_start; best_stroke_info = (stroke, i, False)
-                    if dist_to_end < min_dist: min_dist = dist_to_end; best_stroke_info = (stroke, i, True)
+                    if dist_to_start < min_dist:
+                        min_dist = dist_to_start;
+                        best_stroke_info = (stroke, i, False)
+                    if dist_to_end < min_dist:
+                        min_dist = dist_to_end;
+                        best_stroke_info = (stroke, i, True)
+
                 found_stroke, found_idx, should_reverse = best_stroke_info
                 if should_reverse: found_stroke.reverse()
                 last_pen_position = found_stroke[-1]
@@ -774,6 +801,7 @@ class ImageSketcher:
         for i in range(2, 0, -1):
             layout["main"].update(Panel(f"[bold]Starting in {i}...[/bold]", border_style="green"))
             live.refresh()
+            time.sleep(1)
 
         # --- Drawing Loop ---
         canvas_width = self.canvas_bottom_right[0] - self.canvas_top_left[0]
@@ -784,7 +812,6 @@ class ImageSketcher:
         total_strokes = len(ordered_strokes)
         strokes_drawn = 0
 
-        # Progress bar is now split from time readouts
         progress = Progress(BarColumn(bar_width=None), TextColumn("[bold cyan]{task.percentage:>3.1f}%"))
         progress_task = progress.add_task("Progress", total=total_strokes)
 
@@ -795,75 +822,63 @@ class ImageSketcher:
                     if self.panic_event.is_set(): break
                     strokes_drawn = i + 1
 
-                    # --- Build UI Components ---
                     elapsed_time = time.perf_counter() - start_time
                     strokes_per_sec = strokes_drawn / elapsed_time if elapsed_time > 0 else 0
                     eta_seconds = (elapsed_time / strokes_drawn) * (
                                 total_strokes - strokes_drawn) if strokes_drawn > 0 else float('inf')
                     avg_stroke_time_ms = (elapsed_time / strokes_drawn) * 1000 if strokes_drawn > 0 else 0
 
-                    center_x = (stroke[0][0] + stroke[1][0]) / 2;
+                    center_x = (stroke[0][0] + stroke[1][0]) / 2
                     center_y = (stroke[0][1] + stroke[1][1]) / 2
-                    grid_x = int(center_x // cell_width);
-                    grid_y = int(center_y // cell_height)
+                    grid_x = min(int(center_x // cell_width), GRID_DIVISIONS - 1)
+                    grid_y = min(int(center_y // cell_height), GRID_DIVISIONS - 1)
                     current_grid_cell = (grid_y * GRID_DIVISIONS + grid_x) + 1
 
-                    # --- Parameters Panel (Mission Briefing) ---
+                    # --- UI Panels ---
                     canvas_w = self.canvas_bottom_right[0] - self.canvas_top_left[0]
                     canvas_h = self.canvas_bottom_right[1] - self.canvas_top_left[1]
+
                     param_table = Table(box=None, show_header=False, expand=True)
                     param_table.add_column(style="bold dim", width=12);
                     param_table.add_column(style="bright_white")
                     param_table.add_row("Speed:", f"{DRAWING_SPEED_PERCENT}%")
-                    param_table.add_row("Upscale:", "Real-ESRGAN" if USE_UPSCALER else "None")
                     param_table.add_row("Strokes:", f"{total_strokes}")
                     param_table.add_row("Canvas:", f"{canvas_w}x{canvas_h}px")
-                    param_table.add_row("Grid Size:", f"{GRID_DIVISIONS}x{GRID_DIVISIONS}")
-                    param_table.add_row("Stitching:", f"{STITCHING_DISTANCE} px")
-                    param_table.add_row("Glide Speed:", f"{GLIDE_STEP_SIZE} px/s")
-                    param_table.add_row("Contrast:", f"CLAHE ({CLAHE_CLIP_LIMIT})")
+                    param_table.add_row("Shading:", f"Hatch ({HATCH_SPACING}px)")
+                    param_table.add_row("Stitching:", f"{STITCHING_DISTANCE} px (S-Curve)")
                     param_table.add_row("Threshold:", f"Binary ({BINARY_THRESHOLD})")
-                    param_table.add_row("Post-Pro.:", f"Blur {MEDIAN_BLUR_SIZE} | Clean {MINIMUM_PIXEL_AREA}")
 
-                    # --- Live Status Panel (Cockpit View) ---
-                    data_rate_bps = (self.api_call_counter * self.COMMAND_PACKET_SIZE) / elapsed_time if elapsed_time > 0 else 0
-                    formatted_rate = self._format_data_rate(data_rate_bps)
+                    data_rate_bps = (
+                                                self.api_call_counter * self.COMMAND_PACKET_SIZE) / elapsed_time if elapsed_time > 0 else 0
+
                     status_table = Table(box=None, show_header=False, expand=True)
-                    status_table.add_column(style="bold dim", width=12)
+                    status_table.add_column(style="bold dim", width=12);
                     status_table.add_column()
                     status_table.add_row("Progress:", progress)
                     time_str = f"[cyan]Elapsed:[/] [bright_white]{self._format_time(elapsed_time)}[/] [dim]|[/] [cyan]ETA:[/] [yellow]{self._format_time(eta_seconds) if eta_seconds != float('inf') else '...'}[/]"
                     status_table.add_row("Time:", time_str)
-                    status_table.add_row("Pen State:", Spinner("dots", text=f"{self.current_pen_state} {strokes_drawn}/{total_strokes}"))
+                    status_table.add_row("Pen State:", Spinner("dots",
+                                                               text=f"{self.current_pen_state} {strokes_drawn}/{total_strokes}"))
                     status_table.add_row("Complexity:", f"{len(stroke)} vertices")
                     status_table.add_row("API Calls:", f"{self.api_call_counter:,}")
-                    status_table.add_row("Data Rate:", formatted_rate)
+                    status_table.add_row("Data Rate:", self._format_data_rate(data_rate_bps))
                     status_table.add_row("Stroke Time:", f"{avg_stroke_time_ms:.0f}ms (avg)")
-                    status_table.add_row("Speed:", f"{strokes_per_sec:.1f} strk/s")
-                    status_table.add_row("Location:", f"Grid {current_grid_cell} of {GRID_DIVISIONS ** 2}")
                     status_table.add_row("Distance:", self._format_distance(self.total_distance_traveled))
 
                     log_panel = Panel('\n'.join(self._log_messages), title="[bold]Event Log", border_style="dim green")
 
-                    # --- Render Stroke Preview ---
-                    # Use fixed character dimensions for the preview panel
                     preview_width, preview_height = 38, 10
                     braille_canvas = self._render_stroke_to_braille(stroke, preview_width, preview_height)
                     aligned_canvas = Align.center(braille_canvas, vertical="middle")
                     preview_panel = Panel(aligned_canvas, title="[bold]Live Preview", border_style="green",
                                           height=preview_height + 2, padding=0)
 
-                    # --- Update Layout ---
-                    layout["side"].split(
-                        Panel(param_table, title="[bold]Parameters", border_style="green"),
-                        preview_panel
-                    )
-                    layout["body"].split(
-                        Panel(status_table, title="[bold]Live Status", border_style="green"),
-                        log_panel
-                    )
+                    layout["side"].split(Panel(param_table, title="[bold]Parameters", border_style="green"),
+                                         preview_panel)
+                    layout["body"].split(Panel(status_table, title="[bold]Live Status", border_style="green"),
+                                         log_panel)
 
-                    # --- Draw and Update ---
+                    # --- Execute Render ---
                     self._draw_path(stroke, scale, offset_x, offset_y, WINDOWS_SCALING_FACTOR)
                     time.sleep(self.inter_stroke_delay)
                     progress.update(progress_task, advance=1)
